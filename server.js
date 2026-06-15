@@ -162,6 +162,63 @@ app.get("/api/indicadores", requireAuth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── IPCA acumulado entre duas datas (real, mês a mês) ─────────────────────────
+// GET /api/ipca-acumulado?inicio=2024-01-15&fim=2026-06-14
+// Retorna { fator: 1.0834, percentual: 8.34, meses: [...] }
+app.get("/api/ipca-acumulado", requireAuth, async (req, res) => {
+  const { inicio, fim } = req.query;
+  if (!inicio) return res.status(400).json({ error: "data de início obrigatória" });
+  try {
+    const di = new Date(inicio);
+    const df = fim ? new Date(fim) : new Date();
+    // BCB usa formato DD/MM/AAAA
+    const fmtBCB = d => `${String(d.getDate()).padStart(2,"0")}/${String(d.getMonth()+1).padStart(2,"0")}/${d.getFullYear()}`;
+    const url = `https://api.bcb.gov.br/dados/serie/bcdata.sgs.433/dados?formato=json&dataInicial=${fmtBCB(di)}&dataFinal=${fmtBCB(df)}`;
+    const r = await fetchT(url, 8000);
+    const dados = await r.json();
+    // Acumula: produto de (1 + ipca/100)
+    let fator = 1;
+    const meses = dados.map(d => {
+      const v = parseFloat(d.valor);
+      fator *= (1 + v/100);
+      return { mes: d.data, ipca: v };
+    });
+    res.json({
+      fator,
+      percentual: parseFloat(((fator-1)*100).toFixed(4)),
+      meses,
+      qtd_meses: meses.length,
+      fonte: "bcb",
+      atualizado: new Date().toISOString(),
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── CDI acumulado entre duas datas (real, dia a dia) ──────────────────────────
+// GET /api/cdi-acumulado?inicio=2024-01-15&fim=2026-06-14
+app.get("/api/cdi-acumulado", requireAuth, async (req, res) => {
+  const { inicio, fim } = req.query;
+  if (!inicio) return res.status(400).json({ error: "data de início obrigatória" });
+  try {
+    const di = new Date(inicio);
+    const df = fim ? new Date(fim) : new Date();
+    const fmtBCB = d => `${String(d.getDate()).padStart(2,"0")}/${String(d.getMonth()+1).padStart(2,"0")}/${d.getFullYear()}`;
+    // Série 12 = CDI diário
+    const url = `https://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados?formato=json&dataInicial=${fmtBCB(di)}&dataFinal=${fmtBCB(df)}`;
+    const r = await fetchT(url, 8000);
+    const dados = await r.json();
+    let fator = 1;
+    dados.forEach(d => { fator *= (1 + parseFloat(d.valor)/100); });
+    res.json({
+      fator,
+      percentual: parseFloat(((fator-1)*100).toFixed(4)),
+      qtd_dias: dados.length,
+      fonte: "bcb",
+      atualizado: new Date().toISOString(),
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Proventos B3 ──────────────────────────────────────────────────────────────
 app.get("/api/proventos/:ticker", requireAuth, async (req, res) => {
   const { ticker } = req.params;
