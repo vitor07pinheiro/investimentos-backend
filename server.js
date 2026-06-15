@@ -232,7 +232,7 @@ app.get("/api/proventos/:ticker", requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ status:"ok", versao:"2.0.0", msg:"Backend Investimentos Familiares" });
+  res.json({ status:"ok", versao:"3.0.0", msg:"Backend com IPCA/CDI acumulado real" });
 });
 
 app.listen(PORT, () => console.log(`Servidor na porta ${PORT}`));
