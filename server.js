@@ -232,7 +232,7 @@ app.get("/api/proventos/:ticker", requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ status:"ok", versao:"3.0.0", msg:"Backend com IPCA/CDI acumulado real" });
+  res.json({ status:"ok", versao:"3.2.0", msg:"Backend resiliente a tickers individuais" });
 });
 
 app.listen(PORT, () => console.log(`Servidor na porta ${PORT}`));
