@@ -232,7 +232,7 @@ app.get("/api/proventos/:ticker", requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ status:"ok", versao:"3.3.0", msg:"Backend 1 ticker por requisição (plano gratuito BRAPI)" });
+  res.json({ status:"ok", versao:"3.4.0", msg:"Backend com concorrência limitada" });
 });
 
 app.listen(PORT, () => console.log(`Servidor na porta ${PORT}`));
