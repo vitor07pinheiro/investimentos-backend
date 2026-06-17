@@ -5,34 +5,31 @@ const crypto  = require("crypto");
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-const BRAPI_TOKEN  = process.env.BRAPI_TOKEN  || "";
-const JWT_SECRET   = process.env.JWT_SECRET   || "troque-este-segredo-em-producao";
-const AUTH_USER    = process.env.AUTH_USER;
-const AUTH_PASS_HASH = process.env.AUTH_PASS_HASH; // SHA-256 da senha em hex
+const BRAPI_TOKEN    = process.env.BRAPI_TOKEN    || "";
+const JWT_SECRET     = process.env.JWT_SECRET     || "troque-este-segredo-em-producao";
+const AUTH_USER      = process.env.AUTH_USER;
+const AUTH_PASS_HASH = process.env.AUTH_PASS_HASH;
 
 app.use(cors());
 app.use(express.json());
 
-// ── Utilitários JWT mínimo (sem dependência externa) ─────────────────────────
+// ── JWT mínimo (sem dependência externa) ──────────────────────────────────────
 function b64url(str) {
-  return Buffer.from(str).toString("base64")
-    .replace(/\+/g,"-").replace(/\//g,"_").replace(/=/g,"");
+  return Buffer.from(str).toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=/g,"");
 }
 function signJwt(payload, secret, expiresInSeconds = 28800) {
-  const header  = b64url(JSON.stringify({ alg:"HS256", typ:"JWT" }));
-  const body    = b64url(JSON.stringify({ ...payload, exp: Math.floor(Date.now()/1000) + expiresInSeconds }));
-  const sig = crypto.createHmac("sha256", secret).update(`${header}.${body}`).digest("base64")
-    .replace(/\+/g,"-").replace(/\//g,"_").replace(/=/g,"");
+  const header = b64url(JSON.stringify({ alg:"HS256", typ:"JWT" }));
+  const body   = b64url(JSON.stringify({ ...payload, exp: Math.floor(Date.now()/1000) + expiresInSeconds }));
+  const sig = crypto.createHmac("sha256", secret).update(`${header}.${body}`).digest("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=/g,"");
   return `${header}.${body}.${sig}`;
 }
 function verifyJwt(token, secret) {
   try {
     const [header, body, sig] = token.split(".");
-    const expected = crypto.createHmac("sha256", secret).update(`${header}.${body}`).digest("base64")
-      .replace(/\+/g,"-").replace(/\//g,"_").replace(/=/g,"");
+    const expected = crypto.createHmac("sha256", secret).update(`${header}.${body}`).digest("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=/g,"");
     if (sig !== expected) return null;
     const payload = JSON.parse(Buffer.from(body, "base64").toString());
-    if (payload.exp < Math.floor(Date.now()/1000)) return null; // expirado
+    if (payload.exp < Math.floor(Date.now()/1000)) return null;
     return payload;
   } catch { return null; }
 }
@@ -40,7 +37,6 @@ function sha256(str) {
   return crypto.createHash("sha256").update(str).digest("hex");
 }
 
-// ── Middleware de autenticação ────────────────────────────────────────────────
 function requireAuth(req, res, next) {
   const auth  = req.headers["authorization"] || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
@@ -51,8 +47,7 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// ── Helper: fetch com timeout ─────────────────────────────────────────────────
-async function fetchT(url, ms = 8000) {
+async function fetchT(url, ms = 7000) {
   const ctrl = new AbortController();
   const id   = setTimeout(() => ctrl.abort(), ms);
   try {
@@ -65,49 +60,96 @@ async function fetchT(url, ms = 8000) {
 // ── LOGIN ─────────────────────────────────────────────────────────────────────
 app.post("/api/auth/login", (req, res) => {
   const { username, password } = req.body || {};
-  if (!username || !password)
-    return res.status(400).json({ error: "Usuário e senha obrigatórios" });
-
+  if (!username || !password) return res.status(400).json({ error: "Usuário e senha obrigatórios" });
   const passHash = sha256(password);
-
-  const userOk = AUTH_USER     ? username === AUTH_USER     : false;
+  const userOk = AUTH_USER      ? username === AUTH_USER      : false;
   const passOk = AUTH_PASS_HASH ? passHash === AUTH_PASS_HASH : false;
-
   if (!userOk || !passOk) {
-    // Delay proposital para dificultar brute-force
     return setTimeout(() => res.status(401).json({ error: "Credenciais inválidas" }), 800);
   }
-
-  const token = signJwt({ sub: username }, JWT_SECRET, 28800); // 8 horas
+  const token = signJwt({ sub: username }, JWT_SECRET, 28800);
   res.json({ token, expiresIn: 28800 });
 });
 
-// ── VERIFY (frontend usa para checar token ao recarregar) ─────────────────────
 app.get("/api/auth/verify", requireAuth, (req, res) => {
   res.json({ ok: true, user: req.user.sub });
 });
 
-// ── Cotações B3 ───────────────────────────────────────────────────────────────
+// ── Cotações B3 (1 ticker por requisição à BRAPI; concorrência limitada) ──────
 app.get("/api/cotacoes/b3", requireAuth, async (req, res) => {
   const { tickers } = req.query;
   if (!tickers) return res.status(400).json({ error: "tickers obrigatório" });
   try {
-    const r = await fetchT(`https://brapi.dev/api/quote/${tickers}?token=${BRAPI_TOKEN}`);
-    const d = await r.json();
-    if (!d.results) return res.status(502).json({ error: "Resposta inválida", raw: d });
-    res.json({ cotacoes: d.results.map(q=>({ ticker:q.symbol, preco:q.regularMarketPrice, variacao_dia:q.regularMarketChangePercent, nome:q.longName||q.shortName||q.symbol })), fonte:"brapi", atualizado:new Date().toISOString() });
+    const lista = tickers.split(",").map(t => t.trim()).filter(Boolean);
+    const cotacoes = [];
+    const nao_encontrados = [];
+    const CONCORRENCIA = 3;
+
+    for (let i = 0; i < lista.length; i += CONCORRENCIA) {
+      const grupo = lista.slice(i, i + CONCORRENCIA);
+      await Promise.all(grupo.map(async (ticker) => {
+        try {
+          const url = `https://brapi.dev/api/quote/${ticker}?token=${BRAPI_TOKEN}`;
+          const r = await fetchT(url, 6000);
+          const d = await r.json();
+          const q = d && d.results && d.results[0];
+          if (q && typeof q.regularMarketPrice === "number") {
+            cotacoes.push({
+              ticker: q.symbol,
+              preco: q.regularMarketPrice,
+              variacao_dia: q.regularMarketChangePercent,
+              nome: q.longName || q.shortName || q.symbol,
+            });
+          } else {
+            nao_encontrados.push(ticker);
+          }
+        } catch(e) {
+          nao_encontrados.push(ticker);
+        }
+      }));
+      if (i + CONCORRENCIA < lista.length) await new Promise(r => setTimeout(r, 150));
+    }
+
+    res.json({ cotacoes, nao_encontrados, fonte: "brapi", atualizado: new Date().toISOString() });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Cotações EUA ──────────────────────────────────────────────────────────────
+// ── Cotações EUA (1 ticker por requisição; concorrência limitada) ─────────────
 app.get("/api/cotacoes/eua", requireAuth, async (req, res) => {
   const { tickers } = req.query;
   if (!tickers) return res.status(400).json({ error: "tickers obrigatório" });
   try {
-    const r = await fetchT(`https://brapi.dev/api/quote/${tickers}?token=${BRAPI_TOKEN}&country=us`);
-    const d = await r.json();
-    if (!d.results) return res.status(502).json({ error: "Resposta inválida", raw: d });
-    res.json({ cotacoes: d.results.map(q=>({ ticker:q.symbol, preco_usd:q.regularMarketPrice, variacao_dia:q.regularMarketChangePercent, nome:q.longName||q.shortName||q.symbol })), fonte:"brapi", atualizado:new Date().toISOString() });
+    const lista = tickers.split(",").map(t => t.trim()).filter(Boolean);
+    const cotacoes = [];
+    const nao_encontrados = [];
+    const CONCORRENCIA = 3;
+
+    for (let i = 0; i < lista.length; i += CONCORRENCIA) {
+      const grupo = lista.slice(i, i + CONCORRENCIA);
+      await Promise.all(grupo.map(async (ticker) => {
+        try {
+          const url = `https://brapi.dev/api/quote/${ticker}?token=${BRAPI_TOKEN}&country=us`;
+          const r = await fetchT(url, 6000);
+          const d = await r.json();
+          const q = d && d.results && d.results[0];
+          if (q && typeof q.regularMarketPrice === "number") {
+            cotacoes.push({
+              ticker: q.symbol,
+              preco_usd: q.regularMarketPrice,
+              variacao_dia: q.regularMarketChangePercent,
+              nome: q.longName || q.shortName || q.symbol,
+            });
+          } else {
+            nao_encontrados.push(ticker);
+          }
+        } catch(e) {
+          nao_encontrados.push(ticker);
+        }
+      }));
+      if (i + CONCORRENCIA < lista.length) await new Promise(r => setTimeout(r, 150));
+    }
+
+    res.json({ cotacoes, nao_encontrados, fonte: "brapi", atualizado: new Date().toISOString() });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -125,7 +167,7 @@ app.get("/api/cambio", requireAuth, async (req, res) => {
   try {
     const r = await fetchT(`https://brapi.dev/api/v2/currency?currency=USD-BRL&token=${BRAPI_TOKEN}`, 5000);
     const d = await r.json();
-    const rate = d?.currency?.[0]?.ask;
+    const rate = d && d.currency && d.currency[0] && d.currency[0].ask;
     if (rate && parseFloat(rate) > 1)
       return res.json({ usd_brl:parseFloat(rate), fonte:"brapi", atualizado:new Date().toISOString() });
   } catch(_) {}
@@ -135,17 +177,17 @@ app.get("/api/cambio", requireAuth, async (req, res) => {
     const dd   = String(hoje.getDate()).padStart(2,"0");
     const yyyy = hoje.getFullYear();
     const fim  = `${mm}%2F${dd}%2F${yyyy}`;
-    const ini  = `${mm}%2F${String(hoje.getDate()-7).padStart(2,"0")}%2F${yyyy}`;
+    const ini  = `${mm}%2F${String(Math.max(1,hoje.getDate()-7)).padStart(2,"0")}%2F${yyyy}`;
     const url  = `https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarPeriodo(dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)?@dataInicial='${ini}'&@dataFinalCotacao='${fim}'&$top=1&$orderby=dataHoraCotacao%20desc&$format=json&$select=cotacaoVenda,dataHoraCotacao`;
     const r = await fetchT(url, 6000);
     const d = await r.json();
-    const rate = d?.value?.[0]?.cotacaoVenda;
+    const rate = d && d.value && d.value[0] && d.value[0].cotacaoVenda;
     if (rate) return res.json({ usd_brl:parseFloat(rate), fonte:"bcb_ptax", atualizado:new Date().toISOString() });
   } catch(_) {}
   res.status(503).json({ error:"Câmbio indisponível", usd_brl:null });
 });
 
-// ── Indicadores ───────────────────────────────────────────────────────────────
+// ── Indicadores (CDI anualizado via Selic Over, Selic meta, IPCA) ─────────────
 app.get("/api/indicadores", requireAuth, async (req, res) => {
   try {
     const [r1,r2,r3] = await Promise.all([
@@ -154,48 +196,45 @@ app.get("/api/indicadores", requireAuth, async (req, res) => {
       fetchT("https://api.bcb.gov.br/dados/serie/bcdata.sgs.433/dados/ultimos/1?formato=json"),
     ]);
     const selicOver = await r1.json();
-    const [selicMeta] = await r2.json();
-    const [ipca]      = await r3.json();
-    const taxaDiaria  = parseFloat(selicOver?.[0]?.valor || 0);
-    const cdiAnual    = parseFloat(((Math.pow(1+taxaDiaria/100,252)-1)*100).toFixed(2));
-    res.json({ cdi_anual:cdiAnual, cdi_diario:taxaDiaria, selic:parseFloat(selicMeta?.valor||0), ipca_mensal:parseFloat(ipca?.valor||0), fonte:"bcb", atualizado:new Date().toISOString() });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── IPCA acumulado entre duas datas (real, mês a mês) ─────────────────────────
-// GET /api/ipca-acumulado?inicio=2024-01-15&fim=2026-06-14
-// Retorna { fator: 1.0834, percentual: 8.34, meses: [...] }
-app.get("/api/ipca-acumulado", requireAuth, async (req, res) => {
-  const { inicio, fim } = req.query;
-  if (!inicio) return res.status(400).json({ error: "data de início obrigatória" });
-  try {
-    const di = new Date(inicio);
-    const df = fim ? new Date(fim) : new Date();
-    // BCB usa formato DD/MM/AAAA
-    const fmtBCB = d => `${String(d.getDate()).padStart(2,"0")}/${String(d.getMonth()+1).padStart(2,"0")}/${d.getFullYear()}`;
-    const url = `https://api.bcb.gov.br/dados/serie/bcdata.sgs.433/dados?formato=json&dataInicial=${fmtBCB(di)}&dataFinal=${fmtBCB(df)}`;
-    const r = await fetchT(url, 8000);
-    const dados = await r.json();
-    // Acumula: produto de (1 + ipca/100)
-    let fator = 1;
-    const meses = dados.map(d => {
-      const v = parseFloat(d.valor);
-      fator *= (1 + v/100);
-      return { mes: d.data, ipca: v };
-    });
+    const selicMetaArr = await r2.json();
+    const ipcaArr = await r3.json();
+    const selicMeta = selicMetaArr[0];
+    const ipca = ipcaArr[0];
+    const taxaDiaria = parseFloat((selicOver[0] && selicOver[0].valor) || 0);
+    const cdiAnual = parseFloat(((Math.pow(1 + taxaDiaria/100, 252) - 1) * 100).toFixed(2));
     res.json({
-      fator,
-      percentual: parseFloat(((fator-1)*100).toFixed(4)),
-      meses,
-      qtd_meses: meses.length,
+      cdi_anual: cdiAnual,
+      cdi_diario: taxaDiaria,
+      selic: parseFloat((selicMeta && selicMeta.valor) || 0),
+      ipca_mensal: parseFloat((ipca && ipca.valor) || 0),
       fonte: "bcb",
       atualizado: new Date().toISOString(),
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── IPCA acumulado entre duas datas (real, mês a mês) ─────────────────────────
+app.get("/api/ipca-acumulado", requireAuth, async (req, res) => {
+  const { inicio, fim } = req.query;
+  if (!inicio) return res.status(400).json({ error: "data de início obrigatória" });
+  try {
+    const di = new Date(inicio);
+    const df = fim ? new Date(fim) : new Date();
+    const fmtBCB = d => `${String(d.getDate()).padStart(2,"0")}/${String(d.getMonth()+1).padStart(2,"0")}/${d.getFullYear()}`;
+    const url = `https://api.bcb.gov.br/dados/serie/bcdata.sgs.433/dados?formato=json&dataInicial=${fmtBCB(di)}&dataFinal=${fmtBCB(df)}`;
+    const r = await fetchT(url, 8000);
+    const dados = await r.json();
+    let fator = 1;
+    const meses = dados.map(d => {
+      const v = parseFloat(d.valor);
+      fator *= (1 + v/100);
+      return { mes: d.data, ipca: v };
+    });
+    res.json({ fator, percentual: parseFloat(((fator-1)*100).toFixed(4)), meses, qtd_meses: meses.length, fonte: "bcb", atualizado: new Date().toISOString() });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── CDI acumulado entre duas datas (real, dia a dia) ──────────────────────────
-// GET /api/cdi-acumulado?inicio=2024-01-15&fim=2026-06-14
 app.get("/api/cdi-acumulado", requireAuth, async (req, res) => {
   const { inicio, fim } = req.query;
   if (!inicio) return res.status(400).json({ error: "data de início obrigatória" });
@@ -203,19 +242,12 @@ app.get("/api/cdi-acumulado", requireAuth, async (req, res) => {
     const di = new Date(inicio);
     const df = fim ? new Date(fim) : new Date();
     const fmtBCB = d => `${String(d.getDate()).padStart(2,"0")}/${String(d.getMonth()+1).padStart(2,"0")}/${d.getFullYear()}`;
-    // Série 12 = CDI diário
     const url = `https://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados?formato=json&dataInicial=${fmtBCB(di)}&dataFinal=${fmtBCB(df)}`;
     const r = await fetchT(url, 8000);
     const dados = await r.json();
     let fator = 1;
     dados.forEach(d => { fator *= (1 + parseFloat(d.valor)/100); });
-    res.json({
-      fator,
-      percentual: parseFloat(((fator-1)*100).toFixed(4)),
-      qtd_dias: dados.length,
-      fonte: "bcb",
-      atualizado: new Date().toISOString(),
-    });
+    res.json({ fator, percentual: parseFloat(((fator-1)*100).toFixed(4)), qtd_dias: dados.length, fonte: "bcb", atualizado: new Date().toISOString() });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -225,15 +257,14 @@ app.get("/api/proventos/:ticker", requireAuth, async (req, res) => {
   try {
     const r = await fetchT(`https://brapi.dev/api/quote/${ticker}?modules=dividendsData&token=${BRAPI_TOKEN}`);
     const d = await r.json();
-    const divs = d?.results?.[0]?.dividendsData?.cashDividends || [];
-    res.json({ ticker, proventos: divs.slice(0,12).map(d=>({ ticker, tipo:d.label||"Dividendo", valor:d.rate, data_com:d.lastDatePrior, data_pagamento:d.paymentDate })), fonte:"brapi", atualizado:new Date().toISOString() });
+    const divs = (d && d.results && d.results[0] && d.results[0].dividendsData && d.results[0].dividendsData.cashDividends) || [];
+    res.json({ ticker, proventos: divs.slice(0,12).map(x => ({ ticker, tipo:x.label||"Dividendo", valor:x.rate, data_com:x.lastDatePrior, data_pagamento:x.paymentDate })), fonte:"brapi", atualizado:new Date().toISOString() });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Health check ──────────────────────────────────────────────────────────────
-// ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ status:"ok", versao:"3.4.1", msg:"Backend com concorrência limitada - 1 ticker por chamada BRAPI" });
+  res.json({ status:"ok", versao:"3.4.1", msg:"Backend com cotacoes 1 ticker por chamada BRAPI" });
 });
 
 app.listen(PORT, () => console.log(`Servidor na porta ${PORT}`));
