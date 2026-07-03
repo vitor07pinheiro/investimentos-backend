@@ -1,6 +1,7 @@
 const express = require("express");
 const cors    = require("cors");
 const crypto  = require("crypto");
+const { MongoClient } = require("mongodb");
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -9,9 +10,25 @@ const BRAPI_TOKEN    = process.env.BRAPI_TOKEN    || "";
 const JWT_SECRET     = process.env.JWT_SECRET     || "troque-este-segredo-em-producao";
 const AUTH_USER      = process.env.AUTH_USER;
 const AUTH_PASS_HASH = process.env.AUTH_PASS_HASH;
+const MONGODB_URI    = process.env.MONGODB_URI;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "5mb" }));
+
+// ── Conexão MongoDB ───────────────────────────────────────────────────────────
+let db = null;
+async function conectarDB() {
+  if (!MONGODB_URI) { console.warn("MONGODB_URI não configurada — dados não serão persistidos"); return; }
+  try {
+    const client = new MongoClient(MONGODB_URI);
+    await client.connect();
+    db = client.db("investimentos");
+    console.log("MongoDB conectado com sucesso");
+  } catch(e) {
+    console.error("Erro ao conectar MongoDB:", e.message);
+  }
+}
+conectarDB();
 
 // ── JWT mínimo (sem dependência externa) ──────────────────────────────────────
 function b64url(str) {
@@ -262,9 +279,38 @@ app.get("/api/proventos/:ticker", requireAuth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Dados do portfólio: carregar e salvar (compartilhado por todos os logins) ──
+// Documento único identificado por "portfolio_familiar"
+app.get("/api/dados", requireAuth, async (req, res) => {
+  if (!db) return res.status(503).json({ error: "Banco de dados indisponível" });
+  try {
+    const doc = await db.collection("portfolios").findOne({ _id: "portfolio_familiar" });
+    if (!doc) {
+      return res.json({ assets:[], provs:[], operacoes:[], snapshots:{}, ativosZerados:{}, goalsTotal:null, goalsClass:null, fatoresAcum:{} });
+    }
+    const { _id, atualizado, ...dados } = doc;
+    res.json({ ...dados, atualizado });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put("/api/dados", requireAuth, async (req, res) => {
+  if (!db) return res.status(503).json({ error: "Banco de dados indisponível" });
+  try {
+    const dados = req.body || {};
+    // Remove campos que não devem ser persistidos
+    delete dados._id;
+    await db.collection("portfolios").updateOne(
+      { _id: "portfolio_familiar" },
+      { $set: { ...dados, atualizado: new Date().toISOString(), atualizadoPor: req.user.sub } },
+      { upsert: true }
+    );
+    res.json({ ok: true, atualizado: new Date().toISOString() });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ status:"ok", versao:"3.4.1", msg:"Backend com cotacoes 1 ticker por chamada BRAPI" });
+  res.json({ status:"ok", versao:"4.0.0", msg:"Backend com MongoDB", db: db ? "conectado" : "desconectado" });
 });
 
 app.listen(PORT, () => console.log(`Servidor na porta ${PORT}`));
