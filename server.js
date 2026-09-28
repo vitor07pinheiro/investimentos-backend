@@ -170,38 +170,138 @@ app.get("/api/cotacoes/eua", requireAuth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Bitcoin ───────────────────────────────────────────────────────────────────
-app.get("/api/cotacoes/crypto", requireAuth, async (req, res) => {
+// ── Helpers de cotação (câmbio e Bitcoin) ─────────────────────────────────────
+// Busca JSON com timeout, User-Agent e sem cache. Lança erro se HTTP != 2xx.
+async function getJSON(url, ms = 7000, headers = {}) {
+  const ctrl = new AbortController();
+  const id   = setTimeout(() => ctrl.abort(), ms);
   try {
-    const r = await fetchT("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=brl,usd&include_24hr_change=true");
-    const d = await r.json();
-    res.json({ bitcoin:{ preco_brl:d.bitcoin.brl, preco_usd:d.bitcoin.usd, variacao_24h:d.bitcoin.brl_24h_change }, fonte:"coingecko", atualizado:new Date().toISOString() });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    const r = await fetch(url, {
+      signal: ctrl.signal,
+      headers: { "Accept": "application/json", "User-Agent": "investimentos-app/1.0", "Cache-Control": "no-cache", ...headers },
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } finally { clearTimeout(id); }
+}
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
+// Faixas de sanidade: descartam respostas absurdas (ex.: 0, null, valor em outra moeda)
+const cambioValido = v => v !== null && v > 2 && v < 20;
+const btcValido    = v => v !== null && v > 1000;
+
+// Cache curto em memória: evita estourar limite das APIs gratuitas se o botão for clicado várias vezes.
+// Também guarda o último valor bom, usado se todas as fontes falharem.
+const cacheCot = { cambio: null, btc: null };
+const CACHE_MS = 60 * 1000;
+
+// ── Bitcoin (CoinGecko → Mercado Bitcoin → Coinbase) ──────────────────────────
+async function btcCoinGecko() {
+  const key = process.env.COINGECKO_API_KEY; // opcional (plano Demo gratuito)
+  const d = await getJSON(
+    "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=brl,usd&include_24hr_change=true",
+    7000, key ? { "x-cg-demo-api-key": key } : {}
+  );
+  const b = d && d.bitcoin;
+  if (!b || !btcValido(num(b.brl))) throw new Error("resposta inválida");
+  return { preco_brl: num(b.brl), preco_usd: num(b.usd), variacao_24h: num(b.brl_24h_change) };
+}
+async function btcMercadoBitcoin() {
+  const d = await getJSON("https://api.mercadobitcoin.net/api/v4/tickers?symbols=BTC-BRL");
+  const t = Array.isArray(d) && d[0];
+  const last = t && num(t.last), open = t && num(t.open);
+  if (!btcValido(last)) throw new Error("resposta inválida");
+  return { preco_brl: last, preco_usd: null, variacao_24h: open ? (last / open - 1) * 100 : null };
+}
+async function btcCoinbase() {
+  const [brl, usd] = await Promise.all([
+    getJSON("https://api.coinbase.com/v2/prices/BTC-BRL/spot"),
+    getJSON("https://api.coinbase.com/v2/prices/BTC-USD/spot").catch(() => null),
+  ]);
+  const p = num(brl && brl.data && brl.data.amount);
+  if (!btcValido(p)) throw new Error("resposta inválida");
+  return { preco_brl: p, preco_usd: num(usd && usd.data && usd.data.amount), variacao_24h: null };
+}
+
+async function obterBitcoin() {
+  const fontes = [["coingecko", btcCoinGecko], ["mercadobitcoin", btcMercadoBitcoin], ["coinbase", btcCoinbase]];
+  const erros = [];
+  for (const [nome, fn] of fontes) {
+    try { return { ...(await fn()), fonte: nome }; }
+    catch (e) { erros.push(`${nome}: ${e.message}`); console.warn(`[BTC] ${nome} falhou: ${e.message}`); }
+  }
+  throw new Error(erros.join(" | "));
+}
+
+app.get("/api/cotacoes/crypto", requireAuth, async (req, res) => {
+  if (cacheCot.btc && Date.now() - cacheCot.btc.ts < CACHE_MS)
+    return res.json({ bitcoin: cacheCot.btc.dado, fonte: cacheCot.btc.fonte, atualizado: cacheCot.btc.atualizado, cache: true });
+  try {
+    const { fonte, ...bitcoin } = await obterBitcoin();
+    // Se a fonte não trouxe preço em USD, deriva pelo câmbio em cache (se houver)
+    if (!bitcoin.preco_usd && cacheCot.cambio) bitcoin.preco_usd = bitcoin.preco_brl / cacheCot.cambio.valor;
+    const atualizado = new Date().toISOString();
+    cacheCot.btc = { dado: bitcoin, fonte, atualizado, ts: Date.now() };
+    res.json({ bitcoin, fonte, atualizado });
+  } catch (e) {
+    if (cacheCot.btc) // devolve o último valor bom, sinalizando que está desatualizado
+      return res.json({ bitcoin: cacheCot.btc.dado, fonte: cacheCot.btc.fonte, atualizado: cacheCot.btc.atualizado, stale: true });
+    res.status(503).json({ error: "Bitcoin indisponível: " + e.message });
+  }
 });
 
-// ── Câmbio USD/BRL ────────────────────────────────────────────────────────────
+// ── Câmbio USD/BRL (BRAPI → AwesomeAPI → PTAX BCB → implícito via BTC) ────────
+async function cambioBrapi() {
+  if (!BRAPI_TOKEN) throw new Error("sem BRAPI_TOKEN");
+  const d = await getJSON(`https://brapi.dev/api/v2/currency?currency=USD-BRL&token=${BRAPI_TOKEN}`, 6000);
+  const c = d && d.currency && d.currency[0];
+  // BRAPI v2 usa askPrice/bidPrice (o campo "ask" não existe — era o bug do valor fixo)
+  const v = c && num(c.askPrice ?? c.bidPrice ?? c.ask ?? c.bid);
+  if (!cambioValido(v)) throw new Error("resposta inválida");
+  return v;
+}
+async function cambioAwesome() {
+  const d = await getJSON("https://economia.awesomeapi.com.br/json/last/USD-BRL", 6000);
+  const v = num(d && d.USDBRL && (d.USDBRL.ask ?? d.USDBRL.bid));
+  if (!cambioValido(v)) throw new Error("resposta inválida");
+  return v;
+}
+async function cambioPtax() {
+  // Janela dos últimos 10 dias corridos (cobre fins de semana, feriados e virada de mês)
+  const fmt = d => `${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}-${d.getFullYear()}`;
+  const fim = new Date();
+  const ini = new Date(fim.getTime() - 10 * 86400000);
+  const url = `https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarPeriodo(dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)?@dataInicial='${fmt(ini)}'&@dataFinalCotacao='${fmt(fim)}'&$format=json&$select=cotacaoVenda,dataHoraCotacao`;
+  const d = await getJSON(url, 8000);
+  const lista = (d && d.value) || [];
+  const ultimo = lista.sort((a, b) => String(b.dataHoraCotacao).localeCompare(String(a.dataHoraCotacao)))[0];
+  const v = num(ultimo && ultimo.cotacaoVenda);
+  if (!cambioValido(v)) throw new Error("resposta inválida");
+  return v;
+}
+async function cambioViaBtc() {
+  // Último recurso: câmbio implícito = BTC em BRL ÷ BTC em USD (mesma fonte). Aproximado (~0,5%).
+  const d = await getJSON("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=brl,usd", 7000);
+  const v = d && d.bitcoin && num(d.bitcoin.brl) / num(d.bitcoin.usd);
+  if (!cambioValido(v)) throw new Error("resposta inválida");
+  return v;
+}
+
 app.get("/api/cambio", requireAuth, async (req, res) => {
-  try {
-    const r = await fetchT(`https://brapi.dev/api/v2/currency?currency=USD-BRL&token=${BRAPI_TOKEN}`, 5000);
-    const d = await r.json();
-    const rate = d && d.currency && d.currency[0] && d.currency[0].ask;
-    if (rate && parseFloat(rate) > 1)
-      return res.json({ usd_brl:parseFloat(rate), fonte:"brapi", atualizado:new Date().toISOString() });
-  } catch(_) {}
-  try {
-    const hoje = new Date();
-    const mm   = String(hoje.getMonth()+1).padStart(2,"0");
-    const dd   = String(hoje.getDate()).padStart(2,"0");
-    const yyyy = hoje.getFullYear();
-    const fim  = `${mm}%2F${dd}%2F${yyyy}`;
-    const ini  = `${mm}%2F${String(Math.max(1,hoje.getDate()-7)).padStart(2,"0")}%2F${yyyy}`;
-    const url  = `https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarPeriodo(dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)?@dataInicial='${ini}'&@dataFinalCotacao='${fim}'&$top=1&$orderby=dataHoraCotacao%20desc&$format=json&$select=cotacaoVenda,dataHoraCotacao`;
-    const r = await fetchT(url, 6000);
-    const d = await r.json();
-    const rate = d && d.value && d.value[0] && d.value[0].cotacaoVenda;
-    if (rate) return res.json({ usd_brl:parseFloat(rate), fonte:"bcb_ptax", atualizado:new Date().toISOString() });
-  } catch(_) {}
-  res.status(503).json({ error:"Câmbio indisponível", usd_brl:null });
+  if (cacheCot.cambio && Date.now() - cacheCot.cambio.ts < CACHE_MS)
+    return res.json({ usd_brl: cacheCot.cambio.valor, fonte: cacheCot.cambio.fonte, atualizado: cacheCot.cambio.atualizado, cache: true });
+  const fontes = [["brapi", cambioBrapi], ["awesomeapi", cambioAwesome], ["bcb_ptax", cambioPtax], ["implicito_btc", cambioViaBtc]];
+  const erros = [];
+  for (const [fonte, fn] of fontes) {
+    try {
+      const valor = await fn();
+      const atualizado = new Date().toISOString();
+      cacheCot.cambio = { valor, fonte, atualizado, ts: Date.now() };
+      return res.json({ usd_brl: valor, fonte, atualizado });
+    } catch (e) { erros.push(`${fonte}: ${e.message}`); console.warn(`[Câmbio] ${fonte} falhou: ${e.message}`); }
+  }
+  if (cacheCot.cambio)
+    return res.json({ usd_brl: cacheCot.cambio.valor, fonte: cacheCot.cambio.fonte, atualizado: cacheCot.cambio.atualizado, stale: true });
+  res.status(503).json({ error: "Câmbio indisponível: " + erros.join(" | "), usd_brl: null });
 });
 
 // ── Indicadores (CDI anualizado via Selic Over, Selic meta, IPCA) ─────────────
@@ -310,7 +410,7 @@ app.put("/api/dados", requireAuth, async (req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ status:"ok", versao:"4.0.0", msg:"Backend com MongoDB", db: db ? "conectado" : "desconectado" });
+  res.json({ status:"ok", versao:"4.1.0", msg:"Backend com MongoDB", db: db ? "conectado" : "desconectado" });
 });
 
 app.listen(PORT, () => console.log(`Servidor na porta ${PORT}`));
