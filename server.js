@@ -5,6 +5,7 @@ const { MongoClient } = require("mongodb");
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
+const VERSAO = "4.2.0";
 
 const BRAPI_TOKEN    = process.env.BRAPI_TOKEN    || "";
 const JWT_SECRET     = process.env.JWT_SECRET     || "troque-este-segredo-em-producao";
@@ -100,6 +101,7 @@ app.get("/api/cotacoes/b3", requireAuth, async (req, res) => {
     const lista = tickers.split(",").map(t => t.trim()).filter(Boolean);
     const cotacoes = [];
     const nao_encontrados = [];
+    const erros = {};
     const CONCORRENCIA = 3;
 
     for (let i = 0; i < lista.length; i += CONCORRENCIA) {
@@ -119,15 +121,20 @@ app.get("/api/cotacoes/b3", requireAuth, async (req, res) => {
             });
           } else {
             nao_encontrados.push(ticker);
+            // Guarda o motivo real devolvido pela BRAPI (ex.: MISSING_TOKEN, INVALID_TOKEN, limite do plano)
+            erros[ticker] = `HTTP ${r.status}${d && (d.code || d.message) ? " · " + (d.code || "") + " " + (d.message || "") : ""}`.trim();
           }
         } catch(e) {
           nao_encontrados.push(ticker);
+          erros[ticker] = e.name === "AbortError" ? "timeout" : e.message;
         }
       }));
       if (i + CONCORRENCIA < lista.length) await new Promise(r => setTimeout(r, 150));
     }
 
-    res.json({ cotacoes, nao_encontrados, fonte: "brapi", atualizado: new Date().toISOString() });
+    const motivos = [...new Set(Object.values(erros))];
+    if (motivos.length) console.warn(`[BRAPI] ${nao_encontrados.length} ticker(s) falharam: ${motivos.join(" | ")}`);
+    res.json({ cotacoes, nao_encontrados, erros, motivos, fonte: "brapi", atualizado: new Date().toISOString() });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -139,6 +146,7 @@ app.get("/api/cotacoes/eua", requireAuth, async (req, res) => {
     const lista = tickers.split(",").map(t => t.trim()).filter(Boolean);
     const cotacoes = [];
     const nao_encontrados = [];
+    const erros = {};
     const CONCORRENCIA = 3;
 
     for (let i = 0; i < lista.length; i += CONCORRENCIA) {
@@ -158,15 +166,20 @@ app.get("/api/cotacoes/eua", requireAuth, async (req, res) => {
             });
           } else {
             nao_encontrados.push(ticker);
+            // Guarda o motivo real devolvido pela BRAPI (ex.: MISSING_TOKEN, INVALID_TOKEN, limite do plano)
+            erros[ticker] = `HTTP ${r.status}${d && (d.code || d.message) ? " · " + (d.code || "") + " " + (d.message || "") : ""}`.trim();
           }
         } catch(e) {
           nao_encontrados.push(ticker);
+          erros[ticker] = e.name === "AbortError" ? "timeout" : e.message;
         }
       }));
       if (i + CONCORRENCIA < lista.length) await new Promise(r => setTimeout(r, 150));
     }
 
-    res.json({ cotacoes, nao_encontrados, fonte: "brapi", atualizado: new Date().toISOString() });
+    const motivos = [...new Set(Object.values(erros))];
+    if (motivos.length) console.warn(`[BRAPI] ${nao_encontrados.length} ticker(s) falharam: ${motivos.join(" | ")}`);
+    res.json({ cotacoes, nao_encontrados, erros, motivos, fonte: "brapi", atualizado: new Date().toISOString() });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -408,9 +421,50 @@ app.put("/api/dados", requireAuth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Diagnóstico (público, não expõe segredos) ─────────────────────────────────
+// Abra https://<backend>/api/diagnostico no navegador para ver o estado de cada integração.
+let cacheDiag = null;
+app.get("/api/diagnostico", async (req, res) => {
+  if (cacheDiag && Date.now() - cacheDiag.ts < 60000) return res.json({ ...cacheDiag.dado, cache: true });
+  const testar = async (nome, url, extrair) => {
+    const t0 = Date.now();
+    try {
+      const ctrl = new AbortController(); const id = setTimeout(() => ctrl.abort(), 8000);
+      const r = await fetch(url, { signal: ctrl.signal, headers: { "Accept": "application/json", "User-Agent": "investimentos-app/1.0" } });
+      clearTimeout(id);
+      const txt = await r.text(); let d = null; try { d = JSON.parse(txt); } catch(_) {}
+      let valor = null; try { valor = d ? extrair(d) : null; } catch(_) {}
+      return { nome, ok: r.ok && valor !== null && valor !== undefined, http: r.status, valor, ms: Date.now() - t0,
+               erro: r.ok ? undefined : (d && (d.code || d.message || d.error)) || txt.slice(0, 150) };
+    } catch (e) { return { nome, ok: false, erro: e.name === "AbortError" ? "timeout 8s" : e.message, ms: Date.now() - t0 }; }
+  };
+  const tk = encodeURIComponent(BRAPI_TOKEN);
+  const fim = new Date(), ini = new Date(Date.now() - 10 * 86400000);
+  const f = d => `${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}-${d.getFullYear()}`;
+  const testes = await Promise.all([
+    testar("brapi_acao_BBAS3 (exige token)", `https://brapi.dev/api/quote/BBAS3?token=${tk}`, d => d.results[0].regularMarketPrice),
+    testar("brapi_eua_AAPL", `https://brapi.dev/api/quote/AAPL?token=${tk}&country=us`, d => d.results[0].regularMarketPrice),
+    testar("brapi_cambio", `https://brapi.dev/api/v2/currency?currency=USD-BRL&token=${tk}`, d => d.currency[0].askPrice ?? d.currency[0].bidPrice),
+    testar("awesomeapi_cambio", "https://economia.awesomeapi.com.br/json/last/USD-BRL", d => d.USDBRL.ask),
+    testar("bcb_ptax", `https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarPeriodo(dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)?@dataInicial='${f(ini)}'&@dataFinalCotacao='${f(fim)}'&$format=json`, d => d.value.slice(-1)[0].cotacaoVenda),
+    testar("bcb_sgs_cdi", "https://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados/ultimos/1?formato=json", d => d[0].valor),
+    testar("coingecko_btc", "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=brl", d => d.bitcoin.brl),
+    testar("mercadobitcoin_btc", "https://api.mercadobitcoin.net/api/v4/tickers?symbols=BTC-BRL", d => d[0].last),
+    testar("coinbase_btc", "https://api.coinbase.com/v2/prices/BTC-BRL/spot", d => d.data.amount),
+  ]);
+  const dado = {
+    versao: VERSAO, node: process.version, regiao_servidor: process.env.RENDER_REGION || null,
+    env: { BRAPI_TOKEN: BRAPI_TOKEN ? `configurado (${BRAPI_TOKEN.length} caracteres)` : "AUSENTE", MONGODB_URI: !!MONGODB_URI, COINGECKO_API_KEY: !!process.env.COINGECKO_API_KEY },
+    db: db ? "conectado" : "desconectado",
+    testes, gerado_em: new Date().toISOString(),
+  };
+  cacheDiag = { dado, ts: Date.now() };
+  res.json(dado);
+});
+
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ status:"ok", versao:"4.1.0", msg:"Backend com MongoDB", db: db ? "conectado" : "desconectado" });
+  res.json({ status:"ok", versao:VERSAO, msg:"Backend com MongoDB", db: db ? "conectado" : "desconectado" });
 });
 
 app.listen(PORT, () => console.log(`Servidor na porta ${PORT}`));
