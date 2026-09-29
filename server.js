@@ -5,7 +5,7 @@ const { MongoClient } = require("mongodb");
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
-const VERSAO = "4.2.0";
+const VERSAO = "4.3.0";
 
 const BRAPI_TOKEN    = process.env.BRAPI_TOKEN    || "";
 const JWT_SECRET     = process.env.JWT_SECRET     || "troque-este-segredo-em-producao";
@@ -93,95 +93,97 @@ app.get("/api/auth/verify", requireAuth, (req, res) => {
   res.json({ ok: true, user: req.user.sub });
 });
 
-// ── Cotações B3 (1 ticker por requisição à BRAPI; concorrência limitada) ──────
-app.get("/api/cotacoes/b3", requireAuth, async (req, res) => {
-  const { tickers } = req.query;
-  if (!tickers) return res.status(400).json({ error: "tickers obrigatório" });
-  try {
-    const lista = tickers.split(",").map(t => t.trim()).filter(Boolean);
-    const cotacoes = [];
-    const nao_encontrados = [];
-    const erros = {};
-    const CONCORRENCIA = 3;
+// ── Fila única da BRAPI ───────────────────────────────────────────────────────
+// O plano gratuito da BRAPI aceita só 1 requisição simultânea por token (e 1 ticker por requisição).
+// Antes o app disparava 3 em paralelo (+ proventos todos de uma vez) → a BRAPI respondia 429 RATE_LIMITED
+// para as excedentes, e esses tickers apareciam como "não encontrados".
+// Agora TODA chamada à BRAPI (cotações B3/EUA, câmbio, proventos) passa por esta fila, uma de cada vez,
+// com nova tentativa automática em caso de 429.
+const BRAPI_MAX_SIMULTANEAS = parseInt(process.env.BRAPI_CONCORRENCIA || "1", 10); // planos pagos podem subir
+const BRAPI_INTERVALO_MS = 120;
+let brapiAtivas = 0;
+const brapiFilaEspera = [];
+async function brapiSlot() {
+  if (brapiAtivas < BRAPI_MAX_SIMULTANEAS) { brapiAtivas++; return; }
+  await new Promise(r => brapiFilaEspera.push(r));
+  brapiAtivas++;
+}
+function brapiLiberar() {
+  setTimeout(() => { brapiAtivas--; const prox = brapiFilaEspera.shift(); if (prox) prox(); }, BRAPI_INTERVALO_MS);
+}
+const dormir = ms => new Promise(r => setTimeout(r, ms));
 
-    for (let i = 0; i < lista.length; i += CONCORRENCIA) {
-      const grupo = lista.slice(i, i + CONCORRENCIA);
-      await Promise.all(grupo.map(async (ticker) => {
-        try {
-          const url = `https://brapi.dev/api/quote/${ticker}?token=${BRAPI_TOKEN}`;
-          const r = await fetchT(url, 6000);
-          const d = await r.json();
-          const q = d && d.results && d.results[0];
-          if (q && typeof q.regularMarketPrice === "number") {
-            cotacoes.push({
-              ticker: q.symbol,
-              preco: q.regularMarketPrice,
-              variacao_dia: q.regularMarketChangePercent,
-              nome: q.longName || q.shortName || q.symbol,
-            });
-          } else {
-            nao_encontrados.push(ticker);
-            // Guarda o motivo real devolvido pela BRAPI (ex.: MISSING_TOKEN, INVALID_TOKEN, limite do plano)
-            erros[ticker] = `HTTP ${r.status}${d && (d.code || d.message) ? " · " + (d.code || "") + " " + (d.message || "") : ""}`.trim();
-          }
-        } catch(e) {
-          nao_encontrados.push(ticker);
-          erros[ticker] = e.name === "AbortError" ? "timeout" : e.message;
-        }
-      }));
-      if (i + CONCORRENCIA < lista.length) await new Promise(r => setTimeout(r, 150));
+// Retorna { status, dados }. Não lança em erro HTTP; lança só em falha de rede/timeout após as tentativas.
+async function brapiGet(caminho, tentativas = 3) {
+  const sep = caminho.includes("?") ? "&" : "?";
+  const url = `https://brapi.dev${caminho}${sep}token=${encodeURIComponent(BRAPI_TOKEN)}`;
+  for (let i = 0; i < tentativas; i++) {
+    await brapiSlot();
+    let status = 0, dados = null, erroRede = null;
+    try {
+      const r = await fetchT(url, 8000);
+      status = r.status;
+      try { dados = await r.json(); } catch (_) {}
+    } catch (e) { erroRede = e; }
+    finally { brapiLiberar(); }
+    if (erroRede) { if (i === tentativas - 1) throw erroRede; await dormir(800 * (i + 1)); continue; }
+    if (status === 429 && i < tentativas - 1) { await dormir(1000 * Math.pow(2, i)); continue; } // 1s, 2s
+    return { status, dados };
+  }
+}
+const motivoBrapi = (status, d) =>
+  `HTTP ${status}${d && (d.code || d.message) ? " · " + [d.code, d.message].filter(Boolean).join(" ") : ""}`;
+
+// Cache de cotações por ticker: o plano gratuito já tem ~30 min de atraso, então reaproveitar
+// por 5 min não perde informação e economiza a cota mensal (15 mil requisições).
+const CACHE_COTACAO_MS = parseInt(process.env.CACHE_COTACAO_MIN || "5", 10) * 60000;
+const cacheTicker = new Map(); // chave "b3:PETR4" / "us:AAPL" → { item, ts }
+
+async function cotarLista(lista, mercado) {
+  const cotacoes = [], nao_encontrados = [], erros = {};
+  let doCache = 0;
+  for (const tickerOrig of lista) {               // sequencial: respeita o limite de 1 simultânea
+    const ticker = tickerOrig.trim().toUpperCase();
+    const chave = `${mercado}:${ticker}`;
+    const c = cacheTicker.get(chave);
+    if (c && Date.now() - c.ts < CACHE_COTACAO_MS) { cotacoes.push(c.item); doCache++; continue; }
+    try {
+      const { status, dados } = await brapiGet(`/api/quote/${encodeURIComponent(ticker)}${mercado === "us" ? "?country=us" : ""}`);
+      const q = dados && dados.results && dados.results[0];
+      if (q && typeof q.regularMarketPrice === "number") {
+        const item = mercado === "us"
+          ? { ticker, preco_usd: q.regularMarketPrice, variacao_dia: q.regularMarketChangePercent, nome: q.longName || q.shortName || ticker }
+          : { ticker, preco: q.regularMarketPrice, variacao_dia: q.regularMarketChangePercent, nome: q.longName || q.shortName || ticker };
+        cacheTicker.set(chave, { item, ts: Date.now() });
+        cotacoes.push(item);
+      } else {
+        nao_encontrados.push(ticker);
+        erros[ticker] = motivoBrapi(status, dados);
+        if (c) cotacoes.push({ ...c.item, desatualizado: true }); // devolve o último preço bom, marcado
+      }
+    } catch (e) {
+      nao_encontrados.push(ticker);
+      erros[ticker] = e.name === "AbortError" ? "timeout" : e.message;
+      if (c) cotacoes.push({ ...c.item, desatualizado: true });
     }
+  }
+  const motivos = [...new Set(Object.values(erros))];
+  if (motivos.length) console.warn(`[BRAPI ${mercado}] ${nao_encontrados.length} ticker(s) falharam: ${motivos.join(" | ")}`);
+  return { cotacoes, nao_encontrados, erros, motivos, do_cache: doCache, fonte: "brapi", atualizado: new Date().toISOString() };
+}
 
-    const motivos = [...new Set(Object.values(erros))];
-    if (motivos.length) console.warn(`[BRAPI] ${nao_encontrados.length} ticker(s) falharam: ${motivos.join(" | ")}`);
-    res.json({ cotacoes, nao_encontrados, erros, motivos, fonte: "brapi", atualizado: new Date().toISOString() });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Cotações EUA (1 ticker por requisição; concorrência limitada) ─────────────
-app.get("/api/cotacoes/eua", requireAuth, async (req, res) => {
-  const { tickers } = req.query;
-  if (!tickers) return res.status(400).json({ error: "tickers obrigatório" });
-  try {
-    const lista = tickers.split(",").map(t => t.trim()).filter(Boolean);
-    const cotacoes = [];
-    const nao_encontrados = [];
-    const erros = {};
-    const CONCORRENCIA = 3;
-
-    for (let i = 0; i < lista.length; i += CONCORRENCIA) {
-      const grupo = lista.slice(i, i + CONCORRENCIA);
-      await Promise.all(grupo.map(async (ticker) => {
-        try {
-          const url = `https://brapi.dev/api/quote/${ticker}?token=${BRAPI_TOKEN}&country=us`;
-          const r = await fetchT(url, 6000);
-          const d = await r.json();
-          const q = d && d.results && d.results[0];
-          if (q && typeof q.regularMarketPrice === "number") {
-            cotacoes.push({
-              ticker: q.symbol,
-              preco_usd: q.regularMarketPrice,
-              variacao_dia: q.regularMarketChangePercent,
-              nome: q.longName || q.shortName || q.symbol,
-            });
-          } else {
-            nao_encontrados.push(ticker);
-            // Guarda o motivo real devolvido pela BRAPI (ex.: MISSING_TOKEN, INVALID_TOKEN, limite do plano)
-            erros[ticker] = `HTTP ${r.status}${d && (d.code || d.message) ? " · " + (d.code || "") + " " + (d.message || "") : ""}`.trim();
-          }
-        } catch(e) {
-          nao_encontrados.push(ticker);
-          erros[ticker] = e.name === "AbortError" ? "timeout" : e.message;
-        }
-      }));
-      if (i + CONCORRENCIA < lista.length) await new Promise(r => setTimeout(r, 150));
-    }
-
-    const motivos = [...new Set(Object.values(erros))];
-    if (motivos.length) console.warn(`[BRAPI] ${nao_encontrados.length} ticker(s) falharam: ${motivos.join(" | ")}`);
-    res.json({ cotacoes, nao_encontrados, erros, motivos, fonte: "brapi", atualizado: new Date().toISOString() });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
+function rotaCotacoes(mercado) {
+  return async (req, res) => {
+    const { tickers } = req.query;
+    if (!tickers) return res.status(400).json({ error: "tickers obrigatório" });
+    try {
+      const lista = [...new Set(tickers.split(",").map(t => t.trim()).filter(Boolean))];
+      res.json(await cotarLista(lista, mercado));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  };
+}
+app.get("/api/cotacoes/b3",  requireAuth, rotaCotacoes("b3"));
+app.get("/api/cotacoes/eua", requireAuth, rotaCotacoes("us"));
 
 // ── Helpers de cotação (câmbio e Bitcoin) ─────────────────────────────────────
 // Busca JSON com timeout, User-Agent e sem cache. Lança erro se HTTP != 2xx.
@@ -236,7 +238,11 @@ async function btcCoinbase() {
 }
 
 async function obterBitcoin() {
-  const fontes = [["coingecko", btcCoinGecko], ["mercadobitcoin", btcMercadoBitcoin], ["coinbase", btcCoinbase]];
+  // Ordem baseada no diagnóstico real do Render: CoinGecko (sem chave) e AwesomeAPI retornam 429 no IP compartilhado.
+  // Se configurar COINGECKO_API_KEY, a CoinGecko volta a ser a primeira.
+  const fontes = process.env.COINGECKO_API_KEY
+    ? [["coingecko", btcCoinGecko], ["mercadobitcoin", btcMercadoBitcoin], ["coinbase", btcCoinbase]]
+    : [["mercadobitcoin", btcMercadoBitcoin], ["coinbase", btcCoinbase], ["coingecko", btcCoinGecko]];
   const erros = [];
   for (const [nome, fn] of fontes) {
     try { return { ...(await fn()), fonte: nome }; }
@@ -265,7 +271,8 @@ app.get("/api/cotacoes/crypto", requireAuth, async (req, res) => {
 // ── Câmbio USD/BRL (BRAPI → AwesomeAPI → PTAX BCB → implícito via BTC) ────────
 async function cambioBrapi() {
   if (!BRAPI_TOKEN) throw new Error("sem BRAPI_TOKEN");
-  const d = await getJSON(`https://brapi.dev/api/v2/currency?currency=USD-BRL&token=${BRAPI_TOKEN}`, 6000);
+  const { status, dados: d } = await brapiGet("/api/v2/currency?currency=USD-BRL", 2);
+  if (status !== 200) throw new Error(motivoBrapi(status, d));
   const c = d && d.currency && d.currency[0];
   // BRAPI v2 usa askPrice/bidPrice (o campo "ask" não existe — era o bug do valor fixo)
   const v = c && num(c.askPrice ?? c.bidPrice ?? c.ask ?? c.bid);
@@ -302,7 +309,7 @@ async function cambioViaBtc() {
 app.get("/api/cambio", requireAuth, async (req, res) => {
   if (cacheCot.cambio && Date.now() - cacheCot.cambio.ts < CACHE_MS)
     return res.json({ usd_brl: cacheCot.cambio.valor, fonte: cacheCot.cambio.fonte, atualizado: cacheCot.cambio.atualizado, cache: true });
-  const fontes = [["brapi", cambioBrapi], ["awesomeapi", cambioAwesome], ["bcb_ptax", cambioPtax], ["implicito_btc", cambioViaBtc]];
+  const fontes = [["brapi", cambioBrapi], ["bcb_ptax", cambioPtax], ["awesomeapi", cambioAwesome], ["implicito_btc", cambioViaBtc]];
   const erros = [];
   for (const [fonte, fn] of fontes) {
     try {
@@ -382,13 +389,25 @@ app.get("/api/cdi-acumulado", requireAuth, async (req, res) => {
 });
 
 // ── Proventos B3 ──────────────────────────────────────────────────────────────
+// Atenção: o plano gratuito da BRAPI NÃO inclui dividendsData. Cada chamada gasta cota sem retorno.
+// Por isso: passa pela fila, guarda resultado por 24h e informa "sem_acesso" quando o plano não cobre.
+const cacheProv = new Map();
+const CACHE_PROV_MS = 24 * 3600 * 1000;
 app.get("/api/proventos/:ticker", requireAuth, async (req, res) => {
-  const { ticker } = req.params;
+  const ticker = String(req.params.ticker || "").toUpperCase();
+  const c = cacheProv.get(ticker);
+  if (c && Date.now() - c.ts < CACHE_PROV_MS) return res.json({ ...c.dado, cache: true });
   try {
-    const r = await fetchT(`https://brapi.dev/api/quote/${ticker}?modules=dividendsData&token=${BRAPI_TOKEN}`);
-    const d = await r.json();
-    const divs = (d && d.results && d.results[0] && d.results[0].dividendsData && d.results[0].dividendsData.cashDividends) || [];
-    res.json({ ticker, proventos: divs.slice(0,12).map(x => ({ ticker, tipo:x.label||"Dividendo", valor:x.rate, data_com:x.lastDatePrior, data_pagamento:x.paymentDate })), fonte:"brapi", atualizado:new Date().toISOString() });
+    const { status, dados: d } = await brapiGet(`/api/quote/${encodeURIComponent(ticker)}?modules=dividendsData`, 2);
+    const r0 = d && d.results && d.results[0];
+    if (status !== 200 || !r0) {
+      return res.status(status === 429 ? 429 : 502).json({ ticker, proventos: [], error: motivoBrapi(status, d) });
+    }
+    const sem_acesso = !r0.dividendsData; // plano não devolve o módulo
+    const divs = (r0.dividendsData && r0.dividendsData.cashDividends) || [];
+    const dado = { ticker, sem_acesso, proventos: divs.slice(0,12).map(x => ({ ticker, tipo:x.label||"Dividendo", valor:x.rate, data_com:x.lastDatePrior, data_pagamento:x.paymentDate })), fonte:"brapi", atualizado:new Date().toISOString() };
+    cacheProv.set(ticker, { dado, ts: Date.now() });
+    res.json(dado);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -438,13 +457,26 @@ app.get("/api/diagnostico", async (req, res) => {
                erro: r.ok ? undefined : (d && (d.code || d.message || d.error)) || txt.slice(0, 150) };
     } catch (e) { return { nome, ok: false, erro: e.name === "AbortError" ? "timeout 8s" : e.message, ms: Date.now() - t0 }; }
   };
-  const tk = encodeURIComponent(BRAPI_TOKEN);
-  const fim = new Date(), ini = new Date(Date.now() - 10 * 86400000);
+    const fim = new Date(), ini = new Date(Date.now() - 10 * 86400000);
   const f = d => `${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}-${d.getFullYear()}`;
   const testes = await Promise.all([
-    testar("brapi_acao_BBAS3 (exige token)", `https://brapi.dev/api/quote/BBAS3?token=${tk}`, d => d.results[0].regularMarketPrice),
-    testar("brapi_eua_AAPL", `https://brapi.dev/api/quote/AAPL?token=${tk}&country=us`, d => d.results[0].regularMarketPrice),
-    testar("brapi_cambio", `https://brapi.dev/api/v2/currency?currency=USD-BRL&token=${tk}`, d => d.currency[0].askPrice ?? d.currency[0].bidPrice),
+    (async () => {
+      // BRAPI em sequência e pela fila (o plano gratuito recusa requisições simultâneas)
+      const seq = [];
+      const viaFila = async (nome, caminho, extrair) => {
+        const t0 = Date.now();
+        try {
+          const { status, dados } = await brapiGet(caminho, 1);
+          let valor = null; try { valor = extrair(dados); } catch(_) {}
+          return { nome, ok: status === 200 && valor != null, http: status, valor, ms: Date.now() - t0, erro: status === 200 ? undefined : motivoBrapi(status, dados) };
+        } catch (e) { return { nome, ok: false, erro: e.message, ms: Date.now() - t0 }; }
+      };
+      seq.push(await viaFila("brapi_acao_BBAS3", "/api/quote/BBAS3", d => d.results[0].regularMarketPrice));
+      seq.push(await viaFila("brapi_eua_AAPL", "/api/quote/AAPL?country=us", d => d.results[0].regularMarketPrice));
+      seq.push(await viaFila("brapi_cambio", "/api/v2/currency?currency=USD-BRL", d => d.currency[0].askPrice ?? d.currency[0].bidPrice));
+      seq.push(await viaFila("brapi_proventos_BBAS3", "/api/quote/BBAS3?modules=dividendsData", d => d.results[0].dividendsData ? "módulo disponível" : null));
+      return seq;
+    })(),
     testar("awesomeapi_cambio", "https://economia.awesomeapi.com.br/json/last/USD-BRL", d => d.USDBRL.ask),
     testar("bcb_ptax", `https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarPeriodo(dataInicial=@dataInicial,dataFinalCotacao=@dataFinalCotacao)?@dataInicial='${f(ini)}'&@dataFinalCotacao='${f(fim)}'&$format=json`, d => d.value.slice(-1)[0].cotacaoVenda),
     testar("bcb_sgs_cdi", "https://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados/ultimos/1?formato=json", d => d[0].valor),
@@ -452,11 +484,12 @@ app.get("/api/diagnostico", async (req, res) => {
     testar("mercadobitcoin_btc", "https://api.mercadobitcoin.net/api/v4/tickers?symbols=BTC-BRL", d => d[0].last),
     testar("coinbase_btc", "https://api.coinbase.com/v2/prices/BTC-BRL/spot", d => d.data.amount),
   ]);
+  const flat = testes.flat();
   const dado = {
-    versao: VERSAO, node: process.version, regiao_servidor: process.env.RENDER_REGION || null,
+    versao: VERSAO, brapi_concorrencia: BRAPI_MAX_SIMULTANEAS, cache_cotacao_min: CACHE_COTACAO_MS / 60000, node: process.version, regiao_servidor: process.env.RENDER_REGION || null,
     env: { BRAPI_TOKEN: BRAPI_TOKEN ? `configurado (${BRAPI_TOKEN.length} caracteres)` : "AUSENTE", MONGODB_URI: !!MONGODB_URI, COINGECKO_API_KEY: !!process.env.COINGECKO_API_KEY },
     db: db ? "conectado" : "desconectado",
-    testes, gerado_em: new Date().toISOString(),
+    testes: flat, gerado_em: new Date().toISOString(),
   };
   cacheDiag = { dado, ts: Date.now() };
   res.json(dado);
